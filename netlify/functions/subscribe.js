@@ -23,65 +23,91 @@ exports.handler = async (event) => {
     }
 
     // Extraer el centro de datos de la clave API (ej. "abcd-us14" -> "us14")
-    const datacenter = apiKey.split('-')[1] || 'us14';
+    // Usar pop() maneja correctamente claves con múltiples guiones
+    const datacenter = apiKey.split('-').pop();
     
     // El hash del suscriptor en Mailchimp es el MD5 del email en minúsculas
     const subscriberHash = crypto.createHash('md5').update(email.toLowerCase()).digest('hex');
 
+    // 1. Suscribir al usuario (PUT /members/:hash)
     const url = `https://${datacenter}.api.mailchimp.com/3.0/lists/${audienceId}/members/${subscriberHash}`;
 
-    // Si no se envían etiquetas, usar la etiqueta por defecto del Lead Magnet
-    const tagsToAdd = tags.length > 0 ? tags : ['Lead Magnet Módulo 1'];
-    
     // Configuración para añadir/actualizar al miembro
-    // Usamos status_if_new: 'subscribed' para que no pida confirmación si es nuevo.
-    // Si ya existe, PUT actualiza sus datos y etiquetas.
-    const data = JSON.stringify({
+    const memberData = JSON.stringify({
       email_address: email,
-      status_if_new: 'subscribed',
-      tags: tagsToAdd
+      status_if_new: 'subscribed'
     });
 
-    const options = {
+    const memberOptions = {
       method: 'PUT',
       headers: {
         'Authorization': `apikey ${apiKey}`,
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data)
+        'Content-Length': Buffer.byteLength(memberData)
       }
     };
 
-    return new Promise((resolve, reject) => {
-      const req = https.request(url, options, (res) => {
+    const subscribeResponse = await new Promise((resolve, reject) => {
+      const req = https.request(url, memberOptions, (res) => {
         let responseBody = '';
         res.on('data', (chunk) => { responseBody += chunk; });
         res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve({
-              statusCode: 200,
-              body: JSON.stringify({ success: true, message: '¡Te has suscrito exitosamente!' })
-            });
-          } else {
-            console.error('Error de Mailchimp:', responseBody);
-            resolve({
-              statusCode: res.statusCode,
-              body: JSON.stringify({ error: 'Error al suscribir', details: JSON.parse(responseBody) })
-            });
-          }
+          resolve({ statusCode: res.statusCode, body: responseBody });
         });
       });
-
-      req.on('error', (e) => {
-        console.error('Error en la petición a Mailchimp:', e);
-        resolve({
-          statusCode: 500,
-          body: JSON.stringify({ error: 'Error de comunicación con el servidor de correos' })
-        });
-      });
-
-      req.write(data);
+      req.on('error', reject);
+      req.write(memberData);
       req.end();
     });
+
+    if (subscribeResponse.statusCode >= 300) {
+      console.error('Error suscribiendo:', subscribeResponse.body);
+      return {
+        statusCode: subscribeResponse.statusCode,
+        body: JSON.stringify({ error: 'Error al suscribir en Mailchimp', details: JSON.parse(subscribeResponse.body || '{}') })
+      };
+    }
+
+    // 2. Aplicar etiquetas (POST /members/:hash/tags)
+    const tagsToAdd = tags.length > 0 ? tags : ['Lead Magnet Módulo 1'];
+    
+    const formattedTags = tagsToAdd.map(tag => ({
+      name: tag,
+      status: 'active'
+    }));
+
+    const tagsData = JSON.stringify({ tags: formattedTags });
+    const tagsUrl = `https://${datacenter}.api.mailchimp.com/3.0/lists/${audienceId}/members/${subscriberHash}/tags`;
+    
+    const tagsOptions = {
+      method: 'POST',
+      headers: {
+        'Authorization': `apikey ${apiKey}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(tagsData)
+      }
+    };
+
+    const tagsResponse = await new Promise((resolve, reject) => {
+      const req = https.request(tagsUrl, tagsOptions, (res) => {
+        let responseBody = '';
+        res.on('data', (chunk) => { responseBody += chunk; });
+        res.on('end', () => resolve({ statusCode: res.statusCode, body: responseBody }));
+      });
+      req.on('error', reject);
+      req.write(tagsData);
+      req.end();
+    });
+
+    if (tagsResponse.statusCode >= 300) {
+      console.error('Error agregando etiquetas:', tagsResponse.body);
+      // No fallamos la petición completa si solo fallan las etiquetas, pero lo logueamos
+    }
+
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ success: true, message: '¡Te has suscrito exitosamente!' })
+    };
 
   } catch (error) {
     console.error('Error en la función subscribe:', error);
